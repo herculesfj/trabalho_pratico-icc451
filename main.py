@@ -19,6 +19,7 @@ import os
 import cv2
 import numpy as np
 import glob
+import matplotlib.pyplot as plt
 
 # ---------------------- Funções auxiliares ----------------------
 
@@ -47,7 +48,9 @@ def find_images_in_raw():
     for ext in extensions:
         images.extend(glob.glob(os.path.join(folder, ext)))
         images.extend(glob.glob(os.path.join(folder, ext.upper())))
-    return images
+    
+    # Remove duplicatas (importante no Windows)
+    return list(set(images))
 
 # ---------------------- 1. Brilho ----------------------
 
@@ -93,6 +96,72 @@ def histogram_local(img, partitions=(1,3)):
     for p in parts:
         vecs.append(histogram_global(p))
     return np.concatenate(vecs)
+
+def plot_global_histogram(img, save_path):
+    # Plota histograma global separado por canais RGB
+    plt.figure(figsize=(12, 8))
+    
+    # Cores dos canais
+    colors = ['red', 'green', 'blue']
+    channel_names = ['Red', 'Green', 'Blue']
+    
+    for i, (color, name) in enumerate(zip(colors, channel_names)):
+        plt.subplot(2, 2, i+1)
+        hist, bins = np.histogram(img[:,:,i].ravel(), bins=256, range=(0,255))
+        plt.plot(bins[:-1], hist, color=color, linewidth=1)
+        plt.title(f'Histograma - Canal {name}')
+        plt.xlabel('Intensidade')
+        plt.ylabel('Frequência')
+        plt.grid(True, alpha=0.3)
+    
+    # Histograma combinado
+    plt.subplot(2, 2, 4)
+    for i, (color, name) in enumerate(zip(colors, channel_names)):
+        hist, bins = np.histogram(img[:,:,i].ravel(), bins=256, range=(0,255))
+        plt.plot(bins[:-1], hist, color=color, linewidth=1, label=name, alpha=0.7)
+    plt.title('Histograma Combinado RGB')
+    plt.xlabel('Intensidade')
+    plt.ylabel('Frequência')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+def plot_local_histogram(img, partitions=(2,3), save_path=None):
+    # Plota histogramas locais de cada partição
+    rows, cols = partitions
+    parts = partition_image(img, rows, cols)
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(15, 5*rows))
+    if rows == 1:
+        axes = axes.reshape(1, -1)
+    if cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    colors = ['red', 'green', 'blue']
+    channel_names = ['Red', 'Green', 'Blue']
+    
+    for idx, part in enumerate(parts):
+        row = idx // cols
+        col = idx % cols
+        ax = axes[row, col]
+        
+        for i, (color, name) in enumerate(zip(colors, channel_names)):
+            hist, bins = np.histogram(part[:,:,i].ravel(), bins=256, range=(0,255))
+            ax.plot(bins[:-1], hist, color=color, linewidth=1, alpha=0.7, label=name)
+        
+        ax.set_title(f'Partição {idx+1} ({row+1},{col+1})')
+        ax.set_xlabel('Intensidade')
+        ax.set_ylabel('Frequência')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
 
 # ---------------------- 5. Transformadas radiométricas ----------------------
 
@@ -231,34 +300,43 @@ def quantize_image(img, n_colors=64):
 def bic_descriptor(img, quant_img):
     # Calcula histograma de borda e interior
     h,w = quant_img.shape[:2]
-    q_flat = quant_img.reshape(-1,3)
-    labels = np.array([tuple(p) for p in q_flat])
-    labels2d = labels.reshape(h,w)
+    
+    # Cria máscara de bordas comparando pixels vizinhos
     border_mask = np.zeros((h,w), dtype=bool)
     for i in range(h):
         for j in range(w):
-            val = labels2d[i,j]
-            neighs = []
-            if i>0: neighs.append(labels2d[i-1,j])
-            if i<h-1: neighs.append(labels2d[i+1,j])
-            if j>0: neighs.append(labels2d[i,j-1])
-            if j<w-1: neighs.append(labels2d[i,j+1])
-            for n in neighs:
-                if not np.array_equal(val, n):
-                    border_mask[i,j] = True
-                    break
+            val = quant_img[i,j]
+            is_border = False
+            
+            # Verifica vizinhos
+            if i>0 and not np.array_equal(val, quant_img[i-1,j]):
+                is_border = True
+            elif i<h-1 and not np.array_equal(val, quant_img[i+1,j]):
+                is_border = True
+            elif j>0 and not np.array_equal(val, quant_img[i,j-1]):
+                is_border = True
+            elif j<w-1 and not np.array_equal(val, quant_img[i,j+1]):
+                is_border = True
+                
+            border_mask[i,j] = is_border
+    
+    # Encontra cores únicas e cria histogramas
+    q_flat = quant_img.reshape(-1,3)
     uniq, inv = np.unique(q_flat, axis=0, return_inverse=True)
     ncolors = uniq.shape[0]
+    
     border_hist = np.zeros(ncolors, dtype=int)
     interior_hist = np.zeros(ncolors, dtype=int)
-    idx2d = inv.reshape(h,w)
+    
+    # Conta pixels de borda e interior
     for i in range(h):
         for j in range(w):
-            idx = idx2d[i,j]
+            idx = inv[i*w + j]  # Índice linear
             if border_mask[i,j]:
                 border_hist[idx] += 1
             else:
                 interior_hist[idx] += 1
+                
     return border_hist, interior_hist, border_mask
 
 def bic_images_from_mask(orig_img, mask_border):
@@ -300,12 +378,16 @@ def process_all(input_path, base_outdir, quant_colors=256):
     ensure_dir(hist_global_dir)
     hg = histogram_global(img)
     np.savetxt(os.path.join(hist_global_dir, f"{base}_histograma_global.txt"), hg, fmt='%d')
+    # Plota e salva o histograma global
+    plot_global_histogram(img, os.path.join(hist_global_dir, f"{base}_histograma_global.png"))
 
     # 4. HISTOGRAMA LOCAL
     hist_local_dir = os.path.join(base_outdir, "04_histograma_local")
     ensure_dir(hist_local_dir)
     hl = histogram_local(img, partitions=(2,3))
     np.savetxt(os.path.join(hist_local_dir, f"{base}_histograma_local.txt"), hl, fmt='%d')
+    # Plota e salva o histograma local
+    plot_local_histogram(img, partitions=(2,3), save_path=os.path.join(hist_local_dir, f"{base}_histograma_local.png"))
 
     # 5. TRANSFORMAÇÕES RADIOMÉTRICAS
     radiometric_dir = os.path.join(base_outdir, "05_transformacoes_radiometricas")
